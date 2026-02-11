@@ -1,14 +1,21 @@
 # Incidently
 
-AI-powered Slack bot for system health checks and incident analysis. Connects to your observability stack via MCP servers.
+AI-powered Slack bot for incident analysis and system investigation. Connects to your observability stack via MCP servers.
 
 ## What It Does
 
-A Slack bot that runs a multi-agent system (powered by Gemini via Google ADK Go) to analyze system health through your existing observability tools. Connects to any tool that exposes an MCP server — Grafana, Datadog, GCP Logging, Elasticsearch, PagerDuty, or anything else. Operates in human-in-the-loop mode — the operator triggers checks and guides further analysis through conversation.
+A Slack bot that runs a multi-agent system (powered by Gemini via Google ADK Go) to investigate system issues through your existing observability tools. Connects to any tool that exposes an MCP server — Grafana, Datadog, GCP Logging, Elasticsearch, PagerDuty, or anything else. Operates in human-in-the-loop mode — the operator describes a problem or asks a question in natural language, and the bot investigates using the available tools and knowledge from playbooks.
+
+No commands. No rigid syntax. The operator just talks to the bot:
+
+- `@bot problems with apple pay` — investigates a specific issue
+- `@bot how's the system doing?` — broad health overview
+- `@bot latency spike on checkout service` — focused investigation
+- `@bot compare error rates to yesterday` — ad-hoc analysis
 
 Three layers of configuration — no code changes needed to adapt to a different stack:
 
-- **Playbooks** define WHAT to analyze (workflows, steps, concrete queries)
+- **Playbooks** define domain knowledge (workflows, steps, concrete queries, dashboard names)
 - **Agent instructions** define HOW each agent behaves (personality, analysis approach, response format)
 - **Agent config** defines infrastructure per agent (model, temperature, which MCP tools)
 
@@ -31,9 +38,11 @@ Slack Gateway (socket mode, @bot mentions, threads)
 ADK Runner (session per thread)
     ↓
 Coordinator Agent (fast model, no tools)
-    ├── reads playbooks, breaks into steps
-    ├── delegates steps to specialist agents
-    ├── aggregates results into final summary
+    ├── has playbooks as knowledge base
+    ├── understands operator's request
+    ├── picks relevant steps from relevant playbooks
+    ├── delegates to specialist agents
+    ├── aggregates results
     │
     ├── Agent A (MCP tools from config)
     ├── Agent B (MCP tools from config)
@@ -48,13 +57,13 @@ Slack Gateway (reply in thread)
 
 **ADK Runner** — manages agent execution within sessions. Each Slack thread = one ADK session with its own conversation history. Uses ADK's `session.InMemoryService()`.
 
-**Coordinator Agent** — the orchestrator. Uses a fast/cheap model. Has no MCP tools itself. Reads playbooks, breaks them into steps, decides which specialist to delegate each step to based on what the step requires and which agents are available. Aggregates results into the final summary.
+**Coordinator Agent** — the orchestrator. Uses a fast/cheap model. Has no MCP tools itself. Has all playbooks as a knowledge base. When the operator asks something, the coordinator understands the request, decides which playbook steps are relevant (might be all steps from one playbook, a subset, or steps from multiple playbooks), delegates to the right specialists, and aggregates results.
 
 **Specialist Agents** — defined entirely in config. Each has its own model, temperature, behavioral instructions, and scoped set of MCP tools. They receive tasks from the coordinator, execute them using their tools, and return structured findings. They don't know about playbooks — they just do what the coordinator asks.
 
 **MCP Toolset** — ADK's built-in `McpToolset` connects to external MCP servers via SSE, discovers available tools, and makes them callable by agents. Each specialist is configured with only the MCP servers relevant to its role.
 
-**Playbooks** — markdown files describing analysis workflows. The coordinator reads and executes them step by step.
+**Playbooks** — markdown files that serve as a knowledge base for the coordinator. They describe analysis workflows, reference concrete dashboard names and queries, and define output formats. The coordinator draws from them selectively — not necessarily running a playbook end-to-end.
 
 **Agent Instructions** — markdown files describing each agent's behavior and response format. Separate from playbooks. Loaded as the agent's system instructions.
 
@@ -69,7 +78,7 @@ internal/
     agent.go              — multi-agent setup, runner, session management
     playbook.go           — playbook loader (YAML frontmatter + markdown)
 instructions/             — agent behavioral instructions (HOW to behave)
-playbooks/                — analysis workflows (WHAT to do)
+playbooks/                — domain knowledge (WHAT to do, WHAT to check)
 config/
   config.yaml             — slack, MCP servers, agent definitions
 ```
@@ -78,24 +87,24 @@ config/
 
 ### Three Layers
 
-**Playbooks** = WHAT to do. Domain-specific analysis workflows with concrete steps referencing dashboard names, log queries, and thresholds. Portable — change these when your system changes.
+**Playbooks** = domain knowledge. Analysis workflows with concrete steps, dashboard names, log queries, thresholds. The coordinator uses them as a knowledge base — picking relevant parts based on what the operator asks. Portable — change these when your system changes.
 
-**Agent instructions** = HOW to behave. General behavioral guidelines per agent role — analysis approach, response format, error handling. Reusable across any playbook.
+**Agent instructions** = behavior. General behavioral guidelines per agent role — analysis approach, response format, error handling. Reusable across any request.
 
 **Agent config** = infrastructure. Model, temperature, which MCP tools. Lives in `config.yaml`.
 
 ### How It Works
 
-1. Operator sends `@bot health`
+1. Operator sends `@bot problems with apple pay`
 2. Slack gateway parses the message, sends progress indicator to the thread
 3. ADK runner finds (or creates) the session for this thread
 4. Coordinator agent receives the message
-5. Coordinator reads available playbooks (loaded at startup with descriptions), matches request to the right playbook
-6. Coordinator reads each step, decides which specialist agent should handle it based on what the step requires and what agents are available
-7. Specialist agents execute their tasks using their MCP tools, return findings
-8. Coordinator aggregates all findings following the playbook's output format
-9. Final summary posted to Slack thread
-10. Follow-up messages in the thread have full conversation context
+5. Coordinator has all playbooks in its knowledge base. It understands "problems with apple pay" and decides which steps from which playbooks are relevant — maybe the payment-related metrics from one playbook, error log search from another, and skips infrastructure checks entirely because they're not relevant
+6. Coordinator delegates each relevant step to the right specialist agent
+7. Specialist agents execute tasks using their MCP tools, return findings
+8. Coordinator aggregates findings into a focused summary about the Apple Pay issue
+9. Summary posted to Slack thread
+10. Follow-up messages in the thread have full conversation context — operator can drill deeper, ask for comparisons, or pivot to a different angle
 
 ### Agent Definitions
 
@@ -105,7 +114,7 @@ Agents are defined in `config.yaml` — fully declarative. The Go code reads thi
 agents:
   - name: coordinator
     model: gemini-2.0-flash
-    description: "Routes operator requests to specialists, aggregates results"
+    description: "Understands operator requests, picks relevant playbook steps, delegates to specialists, aggregates results"
     instruction: "instructions/coordinator.md"
     temperature: 0.1
     tools: []
@@ -131,20 +140,18 @@ To add a new specialist: add a YAML block, write an instruction file, point it t
 
 ### Playbook Format
 
-Playbooks have YAML frontmatter (for description) and markdown body (the workflow). They reference concrete identifiers (dashboard names, log queries, panel names) but are not tied to any specific tool — the coordinator figures out which agent can handle each step.
+Playbooks have YAML frontmatter (for description) and markdown body. They reference concrete identifiers (dashboard names, log queries, panel names). The coordinator uses them as a knowledge base — it may run a playbook fully, partially, or combine steps from multiple playbooks depending on the operator's request.
 
 ```yaml
 ---
-description: "Full system health check — overview metrics, log errors, infrastructure"
+description: "System health check — application metrics, log errors, infrastructure"
 ---
 ```
 
 ```markdown
 # Health Check
 
-Perform a full system health check. Follow all steps in order.
-
-## Step 1: Application Metrics
+## Application Metrics
 
 Query the "Main Overview" dashboard. Pull these panels for the last 15 minutes:
 - Error Rate — separate system errors (5xx) from client errors (4xx)
@@ -154,12 +161,12 @@ Query the "Main Overview" dashboard. Pull these panels for the last 15 minutes:
 Compare each metric to the same time window last week.
 Flag as warning if deviation > 20%, critical if > 50%.
 
-## Step 2: Log Errors
+## Log Errors
 
 Search application logs for the last 15 minutes, severity >= ERROR.
 Identify top error messages, new error types, and affected services.
 
-## Step 3: Infrastructure
+## Infrastructure
 
 Query the "Infrastructure" dashboard. Check:
 - Pod Restarts — last 1 hour
@@ -201,15 +208,19 @@ For each metric checked:
 
 ### Key Principles
 
-**Anomaly ≠ Incident.** Playbooks instruct what to check; agent instructions tell the agent how to distinguish real problems from expected noise.
+**No commands.** The bot understands natural language. The operator describes a problem or asks a question — the coordinator figures out what to investigate.
 
-**Dynamic baseline.** No hardcoded thresholds in agent instructions. Compare to same weekday last week.
+**Playbooks are a knowledge base, not a rigid script.** The coordinator draws from them selectively. "Problems with Apple Pay" triggers only the relevant steps, not a full system scan.
 
-**Concrete identifiers.** Playbooks contain exact dashboard names, panel names, log queries, and filter values. The agent does not guess.
+**Anomaly ≠ Incident.** Agent instructions tell each agent how to distinguish real problems from expected noise.
 
-**Scoped tools.** Each specialist agent only sees the MCP tools relevant to its role. Less noise for the LLM, fewer wrong tool calls.
+**Dynamic baseline.** No hardcoded thresholds. Compare to same weekday last week.
 
-**Generic engine.** The Go code knows nothing about Grafana, logging, or any specific tool. It reads config, builds agents, connects MCP servers, and runs the loop.
+**Concrete identifiers.** Playbooks contain exact dashboard names, panel names, log queries. The agent does not guess.
+
+**Scoped tools.** Each specialist agent only sees the MCP tools relevant to its role.
+
+**Generic engine.** The Go code knows nothing about specific tools. It reads config, builds agents, connects MCP servers, and runs the loop.
 
 ## Config
 
@@ -229,7 +240,7 @@ mcp_servers:
 agents:
   - name: coordinator
     model: gemini-2.0-flash
-    description: "Routes operator requests to specialists, aggregates results"
+    description: "Understands operator requests, picks relevant playbook steps, delegates to specialists, aggregates results"
     instruction: "instructions/coordinator.md"
     temperature: 0.1
     tools: []
@@ -255,69 +266,85 @@ MCP servers are deployed and managed separately. The bot connects to them via SS
 
 ## Slack UX
 
-### Trigger — @bot mention
+### Focused investigation
 
 ```
-Operator: @incidently health
+Operator: @incidently problems with apple pay
+
+Bot:      ⏳ Investigating...
+Bot:      📊 Checking payment service metrics...
+Bot:      📋 Searching logs for apple pay errors...
+
+Bot:      🔍 Apple Pay Investigation — 14:31 UTC
+
+          Payment Service
+          🔴 Apple Pay success rate: 73% (baseline 99.2%)
+          ⚠️ Latency p99: 4.2s (baseline 1.1s)
+          ✅ Other payment methods: normal
+
+          Logs
+          ❌ "Apple Pay token validation timeout" — 312 occurrences since 14:15 UTC
+          ❌ Affected endpoint: /api/payments/apple-pay/validate
+          📈 Started at 14:15, coincides with Apple Pay gateway response time spike
+
+          Likely cause: Apple Pay gateway is responding slowly,
+          causing token validation timeouts.
+
+          Suggest: check Apple's status page, monitor if it recovers.
+```
+
+### Broad health check
+
+```
+Operator: @incidently how's the system doing?
 
 Bot:      ⏳ Analyzing...
 Bot:      📊 Checking application metrics...
-Bot:      📋 Searching logs...
+Bot:      📋 Reviewing logs...
 Bot:      📊 Checking infrastructure...
 
-Bot:      🏥 System Health Check — 14:31 UTC
+Bot:      🏥 System Overview — 14:31 UTC
 
           Application
           ✅ Error rate: 0.8%
-          ⚠️ Latency p99: 1.1s (+22% vs last week)
+          ✅ Latency p99: 1.1s
           ✅ Throughput: 312 rps
 
-          Dependencies
-          ⚠️ ServiceZ: 94.2% — elevated timeouts
-          ✅ Others: normal
-
-          Logs
-          ⚠️ 142 errors (baseline ~80)
-          Top: "connection timeout to ServiceZ"
-
-          Infrastructure
-          ✅ All clear
-
-          ⚠️ 2 warnings — both related to ServiceZ.
-          Suggest: dig into ServiceZ for root cause.
+          ✅ All clear. No anomalies detected.
 ```
 
-### Conversation — follow-up in thread
+### Follow-up in thread
 
 ```
-Operator: dig into ServiceZ
+Operator: what about compared to yesterday?
 
-Bot:      ⏳ Analyzing ServiceZ...
+Bot:      ⏳ Comparing...
 
-Bot:      ServiceZ — last hour:
-          📉 Success rate: 94.2% → trend stable
-          ❌ Top error: read timeout 10s — 84 occurrences
-          🔀 Affected consumers: ConsumerA, ConsumerB
+Bot:      📊 Yesterday vs Today (same hour)
 
-          Not critical, but worth monitoring.
+          Throughput: 312 rps → 298 rps yesterday (normal variance)
+          Error rate: 0.8% → 0.6% yesterday (slightly higher, within range)
+          Latency: 1.1s → 1.0s yesterday (normal)
+
+          No significant differences. System is behaving consistently.
 ```
 
 ### UX Principles
 
+- **No commands** — just natural language
 - Bot always replies **in thread**
 - **@bot mentions** — explicit invocation, no accidental triggers
 - **Progress messages** — intermediate updates during analysis
-- **Natural language** — "check providers" works, no rigid command syntax
-- **Suggests next steps** after every response
+- **Suggests next steps** after every response when issues are found
 
 ## MVP Scope
 
 ### Included
 
-- Manual trigger via Slack (`@bot` mentions, natural language)
+- Natural language interaction via Slack (`@bot` mentions)
 - Multi-agent architecture (coordinator + configurable specialists)
 - Declarative agent config (model, temperature, tools, instructions per agent)
-- Playbooks with YAML frontmatter
+- Playbooks as knowledge base with YAML frontmatter
 - Threaded conversation with session context (ADK in-memory sessions)
 - Progress messages during analysis
 - Read-only — analysis only, no automated actions
