@@ -4,189 +4,214 @@ AI-powered Slack bot for system health checks and incident analysis. Connects to
 
 ## What It Does
 
-A Slack bot that connects to your observability tools (Grafana, Datadog, GCP Logging, Elasticsearch, etc.) via MCP servers, analyzes system health using an LLM (Gemini), and delivers structured summaries in a Slack thread. Operates in human-in-the-loop mode — the operator triggers checks and guides further analysis through conversation. All analysis logic lives in portable markdown playbooks — no code changes needed to adapt to a different stack.
+A Slack bot that runs a multi-agent system (powered by Gemini via Google ADK Go) to analyze system health through your existing observability tools. Connects to any tool that exposes an MCP server — Grafana, Datadog, GCP Logging, Elasticsearch, PagerDuty, or anything else. Operates in human-in-the-loop mode — the operator triggers checks and guides further analysis through conversation.
+
+Three layers of configuration — no code changes needed to adapt to a different stack:
+
+- **Playbooks** define WHAT to analyze (workflows, steps, concrete queries)
+- **Agent instructions** define HOW each agent behaves (personality, analysis approach, response format)
+- **Agent config** defines infrastructure per agent (model, temperature, which MCP tools)
+
+The Go code is generic. It reads config, builds agents, connects to MCP servers, and runs the loop. All domain knowledge lives in playbooks and agent instructions.
 
 ## Stack
 
 - **Go** — primary language
-- **Google ADK Go** (`google.golang.org/adk`) — agent framework with built-in MCP toolset, ReAct loop, and LLM abstraction
+- **Google ADK Go** (`google.golang.org/adk`) — multi-agent framework with built-in MCP toolset, ReAct loop, agent orchestration, and session management
 - **slack-go/slack** — Slack bot (Socket Mode)
-- **In-memory (sync.Map)** — session state (Redis later)
+- **ADK in-memory sessions** — conversation state per thread (Redis later via ADK's session/database)
 
 ## Architecture
 
 ```
 Slack (operator)
     ↓
-Slack Gateway (socket mode, threads)
+Slack Gateway (socket mode, @bot mentions, threads)
     ↓
-Session Manager (per-thread conversation state)
+ADK Runner (session per thread)
     ↓
-ADK Agent (Google ADK Go)
-    ├── LLM (Gemini or other provider via ADK)
-    ├── MCP Toolset (auto-discovers tools from configured MCP servers)
-    └── Playbooks (markdown instructions injected as agent instructions)
+Coordinator Agent (fast model, no tools)
+    ├── reads playbooks, breaks into steps
+    ├── delegates steps to specialist agents
+    ├── aggregates results into final summary
+    │
+    ├── Agent A (MCP tools from config)
+    ├── Agent B (MCP tools from config)
+    └── ... (all defined in config.yaml, not code)
     ↓
 Slack Gateway (reply in thread)
 ```
 
 ### Components
 
-**Slack Gateway** — receives messages via Socket Mode. Distinguishes new commands from ongoing thread conversations. Always replies in thread.
+**Slack Gateway** — receives messages via Socket Mode. Listens for `@bot` mentions. Always replies in thread. Sends progress messages during analysis.
 
-**Session Manager** — each Slack thread = separate session. Stores message history for the ADK agent context. MVP uses sync.Map.
+**ADK Runner** — manages agent execution within sessions. Each Slack thread = one ADK session with its own conversation history. Uses ADK's `session.InMemoryService()`.
 
-**ADK Agent** — core of the system. Google ADK Go handles the ReAct loop (LLM reasoning → tool calls → observation → response), MCP tool discovery, and LLM communication. The agent's instructions are loaded from markdown playbooks.
+**Coordinator Agent** — the orchestrator. Uses a fast/cheap model. Has no MCP tools itself. Reads playbooks, breaks them into steps, decides which specialist to delegate each step to based on what the step requires and which agents are available. Aggregates results into the final summary.
 
-**MCP Toolset** — ADK's built-in `McpToolset` connects to external MCP servers, discovers available tools, and makes them callable by the agent. No custom MCP client code needed.
+**Specialist Agents** — defined entirely in config. Each has its own model, temperature, behavioral instructions, and scoped set of MCP tools. They receive tasks from the coordinator, execute them using their tools, and return structured findings. They don't know about playbooks — they just do what the coordinator asks.
 
-**Playbooks** — markdown files loaded as agent instructions (details below).
+**MCP Toolset** — ADK's built-in `McpToolset` connects to external MCP servers via SSE, discovers available tools, and makes them callable by agents. Each specialist is configured with only the MCP servers relevant to its role.
+
+**Playbooks** — markdown files describing analysis workflows. The coordinator reads and executes them step by step.
+
+**Agent Instructions** — markdown files describing each agent's behavior and response format. Separate from playbooks. Loaded as the agent's system instructions.
 
 ## Package Structure
 
 ```
-/cmd/bot              — entrypoint
-/internal/
-  /slack              — gateway, message parsing, thread management
-  /session            — session manager, conversation state
-  /agent              — ADK agent setup, playbook loader, MCP toolset config
-  /config             — config loader
-
-/playbooks/           — markdown instructions for the agent (portable across installations)
-  health-check.md     — example: full system health check
-  drill-down.md       — example: deep dive into a specific component
-
-/config/
-  config.yaml         — Slack, LLM, and MCP server connection settings
+cmd/bot/main.go           — entrypoint, wiring
+internal/
+  config/config.go        — config loading, env var resolution
+  slack/gateway.go        — socket mode, message handling, threading
+  agent/
+    agent.go              — multi-agent setup, runner, session management
+    playbook.go           — playbook loader (YAML frontmatter + markdown)
+instructions/             — agent behavioral instructions (HOW to behave)
+playbooks/                — analysis workflows (WHAT to do)
+config/
+  config.yaml             — slack, MCP servers, agent definitions
 ```
 
-## Playbooks
+## Multi-Agent Design
 
-Playbooks are **markdown files** — natural language instructions loaded as the ADK agent's system instructions. They describe what to check, in what order, and how to interpret results. They reference concrete dashboard UIDs, panel names, and log queries so the agent knows exactly which MCP tool calls to make.
+### Three Layers
 
-The Go application sets up an ADK agent with: playbook text as instructions, MCP toolsets pointing to configured servers, and the LLM provider. ADK handles the ReAct loop — the agent reads its instructions, decides which tools to call, observes results, and formulates a response. All domain logic lives in the playbooks.
+**Playbooks** = WHAT to do. Domain-specific analysis workflows with concrete steps referencing dashboard names, log queries, and thresholds. Portable — change these when your system changes.
 
-This makes the project **portable**: to adapt Incidently for a different system, write new playbooks and update MCP server config — no Go code changes needed.
+**Agent instructions** = HOW to behave. General behavioral guidelines per agent role — analysis approach, response format, error handling. Reusable across any playbook.
+
+**Agent config** = infrastructure. Model, temperature, which MCP tools. Lives in `config.yaml`.
 
 ### How It Works
 
-1. Operator triggers `/health`
-2. Bot loads `playbooks/health-check.md` as agent instructions
-3. ADK agent is initialized with the playbook instructions + MCP toolsets (connected to servers from config)
-4. Operator's message is passed to the agent
-5. ADK runs the ReAct loop: agent reads playbook → calls MCP tools (dashboards, logs) → observes results → reasons about next step → repeats until done
-6. Agent's final response is posted to Slack thread
-7. On follow-up messages in the thread, the agent has full conversation history and can load drill-down playbooks as needed
+1. Operator sends `@bot health`
+2. Slack gateway parses the message, sends progress indicator to the thread
+3. ADK runner finds (or creates) the session for this thread
+4. Coordinator agent receives the message
+5. Coordinator reads available playbooks (loaded at startup with descriptions), matches request to the right playbook
+6. Coordinator reads each step, decides which specialist agent should handle it based on what the step requires and what agents are available
+7. Specialist agents execute their tasks using their MCP tools, return findings
+8. Coordinator aggregates all findings following the playbook's output format
+9. Final summary posted to Slack thread
+10. Follow-up messages in the thread have full conversation context
 
-### Playbook Routing
+### Agent Definitions
 
-The agent needs to know which playbook to use. MVP approach: **single root playbook + slash-command shortcuts**.
+Agents are defined in `config.yaml` — fully declarative. The Go code reads this config and builds the agent tree. No agent roles are hardcoded.
 
-One main playbook is always loaded as the agent's instructions. It contains all analysis scenarios and describes when to use each one. The agent's ReAct loop decides which section to execute based on the operator's message.
+```yaml
+agents:
+  - name: coordinator
+    model: gemini-2.0-flash
+    description: "Routes operator requests to specialists, aggregates results"
+    instruction: "instructions/coordinator.md"
+    temperature: 0.1
+    tools: []
 
-Slash commands act as shortcuts that load specific playbooks with a pre-filled intent:
+  # Everything below is an example — define whatever agents your stack needs
 
-- `/health` → loads `health-check.md` + sends "perform a health check"
-- `/playbook infra` → loads a specific playbook by name
-- Free-text message in thread → agent already has the playbook + session context, figures out what to do
+  - name: metrics-analyst
+    model: gemini-2.5-pro
+    description: "Queries dashboards and interprets metrics data"
+    instruction: "instructions/metrics-analyst.md"
+    temperature: 0.2
+    tools: [grafana]
 
-The root playbook contains routing logic as part of its instructions:
-
-```markdown
-## When the operator asks for a health check
-Perform the full overview (Steps 1-3 below).
-
-## When the operator asks to dig into a specific component
-Skip the overview. Go directly to detailed analysis
-of that component (Step 4).
-
-## When the operator asks a follow-up question
-Use the data already collected in this session to answer.
-If you need more data, query it.
+  - name: log-analyst
+    model: gemini-2.5-pro
+    description: "Searches and analyzes application logs"
+    instruction: "instructions/log-analyst.md"
+    temperature: 0.2
+    tools: [gcp-logging]
 ```
 
-This keeps things simple — one playbook, one agent, no router layer. When the number of playbooks grows and they become too large for a single context, introduce a lightweight router agent that picks the right playbook based on the operator's message and available playbook descriptions.
+To add a new specialist: add a YAML block, write an instruction file, point it to the right MCP servers. No Go code changes.
 
 ### Playbook Format
 
-Playbooks are written as agent instructions — the same way you'd explain the analysis process to a new engineer, but with exact technical identifiers needed for automation.
+Playbooks have YAML frontmatter (for description) and markdown body (the workflow). They reference concrete identifiers (dashboard names, log queries, panel names) but are not tied to any specific tool — the coordinator figures out which agent can handle each step.
 
-Example (`playbooks/health-check.md`):
+```yaml
+---
+description: "Full system health check — overview metrics, log errors, infrastructure"
+---
+```
 
 ```markdown
 # Health Check
 
-You are performing a system health check. Use the available MCP tools
-to query dashboards and search logs.
+Perform a full system health check. Follow all steps in order.
 
-## Step 1: Overview
+## Step 1: Application Metrics
 
-Query dashboard UID `main-overview`. Pull these panels for the last
-15 minutes:
+Query the "Main Overview" dashboard. Pull these panels for the last 15 minutes:
+- Error Rate — separate system errors (5xx) from client errors (4xx)
+- Latency p99
+- Throughput
 
-- **Error Rate** — separate system errors (5xx, timeouts) from client
-  errors (4xx). If only client errors spiked, the system is healthy —
-  note the source but don't flag it.
-- **Latency p99**
-- **Throughput**
+Compare each metric to the same time window last week.
+Flag as warning if deviation > 20%, critical if > 50%.
 
-Compare each metric to the same time last week. Flag as warning if
-deviation > 20%, critical if > 50%. If throughput is lower but it's
-a weekend or night — that's likely normal, note it but don't flag.
+## Step 2: Log Errors
 
-## Step 2: Dependencies
-
-Query dashboard UID `dependencies-overview`. This shows all external
-dependencies with their current success rate and response time.
-
-Identify dependencies where success rate deviates more than 20% from
-their average over the past week.
-
-For each degraded dependency:
-1. Drill into its dedicated dashboard (linked from the overview)
-2. Check which error codes are increasing
-3. Search logs for that dependency name — look for maintenance
-   notices or upstream errors
-4. Identify which consumers are affected
+Search application logs for the last 15 minutes, severity >= ERROR.
+Identify top error messages, new error types, and affected services.
 
 ## Step 3: Infrastructure
 
-Query dashboard UID `infra-001`:
-- **Pod Restarts** panel — last 1 hour
-- **Queue Lag** panel — last 15 minutes
-- **DB Connections** panel — last 15 minutes
+Query the "Infrastructure" dashboard. Check:
+- Pod Restarts — last 1 hour
+- Queue Lag — last 15 minutes
+- DB Connections — last 15 minutes
 
-If pods restarted, check if there was a deployment in the last hour.
+## Output format
 
-## Output
-
-Present results grouped by: Application, Dependencies, Infrastructure.
-Use ✅ ⚠️ 🔴 indicators. Only show details for anomalies.
-Always suggest what to check next if there are warnings or critical items.
-Include dashboard links where relevant.
+Present results grouped by section. Use status indicators.
+Only show details for warnings and critical items.
+Suggest what to check next if there are issues.
 ```
 
-### Drill-Down Playbooks
+### Agent Instruction Format
 
-When the operator asks to dig deeper, the agent loads the appropriate drill-down playbook. These are domain-specific — each installation writes its own based on its architecture. Examples:
+Agent instructions describe behavior, not workflow. They are independent of any specific playbook or observability tool:
 
-- Detailed dependency analysis: error breakdown, timeline, affected consumers, log search
-- Infrastructure deep dive: pod restarts with reasons, queue consumer details, DB slow queries, deployment correlation
-- Service-specific analysis: per-service metrics, error patterns, upstream/downstream impact
+```markdown
+# Metrics Analyst
 
-Each drill-down playbook contains its own dashboard UIDs, log queries, and analysis logic.
+You are a professional metrics analyst.
+
+## How you work
+
+- Use the available tools to query the dashboards and panels requested.
+- Compare current values to the baseline period specified.
+  If no baseline specified, use the same time window one week ago.
+- Classify: normal, warning (>20% deviation), critical (>50%).
+- Distinguish system errors from client errors.
+- Account for expected patterns (lower weekend/night traffic).
+
+## Response format
+
+For each metric checked:
+- Metric name, current value, baseline value
+- Status (normal / warning / critical)
+- Brief note if anomalous
+```
 
 ### Key Principles
 
-**Anomaly ≠ Incident.** Playbooks should instruct the agent to distinguish between real system problems and expected noise (e.g. client-side errors, normal traffic variance, scheduled maintenance).
+**Anomaly ≠ Incident.** Playbooks instruct what to check; agent instructions tell the agent how to distinguish real problems from expected noise.
 
-**Dynamic baseline.** No hardcoded thresholds. Compare to same weekday last week. Minimum sample size to avoid false positives on low traffic.
+**Dynamic baseline.** No hardcoded thresholds in agent instructions. Compare to same weekday last week.
 
-**Concrete identifiers.** Every playbook contains exact dashboard UIDs, panel names, log queries, and filter values. The agent must not guess — it reads the playbook and knows exactly what MCP calls to make.
+**Concrete identifiers.** Playbooks contain exact dashboard names, panel names, log queries, and filter values. The agent does not guess.
+
+**Scoped tools.** Each specialist agent only sees the MCP tools relevant to its role. Less noise for the LLM, fewer wrong tool calls.
+
+**Generic engine.** The Go code knows nothing about Grafana, logging, or any specific tool. It reads config, builds agents, connects MCP servers, and runs the loop.
 
 ## Config
-
-Only minimal static configuration that the engine needs to operate:
 
 ```yaml
 # config/config.yaml
@@ -195,89 +220,106 @@ slack:
   app_token: "${SLACK_APP_TOKEN}"
   bot_token: "${SLACK_BOT_TOKEN}"
 
-llm:
-  provider: "gemini"
-  model: "gemini-2.5-pro"
-  api_key: "${GEMINI_API_KEY}"
-
 mcp_servers:
   - name: grafana
     url: "https://grafana-mcp.internal.example.com/sse"
-
   - name: gcp-logging
     url: "https://gcp-logging-mcp.internal.example.com/sse"
+
+agents:
+  - name: coordinator
+    model: gemini-2.0-flash
+    description: "Routes operator requests to specialists, aggregates results"
+    instruction: "instructions/coordinator.md"
+    temperature: 0.1
+    tools: []
+
+  - name: metrics-analyst
+    model: gemini-2.5-pro
+    description: "Queries dashboards and interprets metrics data"
+    instruction: "instructions/metrics-analyst.md"
+    temperature: 0.2
+    tools: [grafana]
+
+  - name: log-analyst
+    model: gemini-2.5-pro
+    description: "Searches and analyzes application logs"
+    instruction: "instructions/log-analyst.md"
+    temperature: 0.2
+    tools: [gcp-logging]
+
+playbooks_dir: "playbooks/"
 ```
 
-MCP servers are deployed and managed separately. The bot connects to them via SSE as a client. ADK's `McpToolset` handles connection, tool discovery, and execution.
+MCP servers are deployed and managed separately. The bot connects to them via SSE as a client. ADK's `McpToolset` handles connection, tool discovery, and execution. Which agents use which MCP servers is defined in the agent config — the bot wires it up at startup.
 
 ## Slack UX
 
-### Trigger — Manual
+### Trigger — @bot mention
 
 ```
-Operator: /health
+Operator: @incidently health
 
-Bot: 🔍 Checking system health...
+Bot:      ⏳ Analyzing...
+Bot:      📊 Checking application metrics...
+Bot:      📋 Searching logs...
+Bot:      📊 Checking infrastructure...
 
-Bot: 🏥 System Health Check — 14:31 UTC
+Bot:      🏥 System Health Check — 14:31 UTC
 
-     Application
-     ✅ Error rate: 0.8%
-     ✅ Latency p99: 1.1s
-     ✅ Throughput: 312 rps (last week: 305 rps)
+          Application
+          ✅ Error rate: 0.8%
+          ⚠️ Latency p99: 1.1s (+22% vs last week)
+          ✅ Throughput: 312 rps
 
-     Dependencies
-     ✅ ServiceX: 99.1%
-     ⚠️ ServiceZ: 94.2% — elevated timeouts
-     ✅ Others: normal
+          Dependencies
+          ⚠️ ServiceZ: 94.2% — elevated timeouts
+          ✅ Others: normal
 
-     Infrastructure
-     ✅ CPU/Memory: normal
-     ✅ Queue lag: 12ms
-     ✅ DB connections: 45/200
+          Logs
+          ⚠️ 142 errors (baseline ~80)
+          Top: "connection timeout to ServiceZ"
 
-     ⚠️ 1 warning: ServiceZ
+          Infrastructure
+          ✅ All clear
 
-     Dig into ServiceZ?
+          ⚠️ 2 warnings — both related to ServiceZ.
+          Suggest: dig into ServiceZ for root cause.
 ```
 
-### Conversation — Natural Language in Thread
+### Conversation — follow-up in thread
 
 ```
-Operator: let's see
+Operator: dig into ServiceZ
 
-Bot: ServiceZ last hour:
-     📉 Success rate: 94.2% → trend stable
-     ❌ Top error: read timeout 10s — 84 times
-     🔀 Affected: ConsumerA, ConsumerB
-     📊 Volume: 4.2% of total traffic
-     Not critical, worth monitoring.
-     📎 [ServiceZ dashboard link]
+Bot:      ⏳ Analyzing ServiceZ...
+
+Bot:      ServiceZ — last hour:
+          📉 Success rate: 94.2% → trend stable
+          ❌ Top error: read timeout 10s — 84 occurrences
+          🔀 Affected consumers: ConsumerA, ConsumerB
+
+          Not critical, but worth monitoring.
 ```
-
-### Launch Variations
-
-- `/health` — full health check
-- `check dependencies` — specific area
-- `what's up with ServiceX?` — specific component
-- `how are we compared to yesterday?` — comparison
 
 ### UX Principles
 
 - Bot always replies **in thread**
-- **Natural language** — "check providers" works same as slash commands
-- **Dashboard links** — bot complements your observability tools, doesn't replace them
+- **@bot mentions** — explicit invocation, no accidental triggers
+- **Progress messages** — intermediate updates during analysis
+- **Natural language** — "check providers" works, no rigid command syntax
 - **Suggests next steps** after every response
-- **Timers** — "remind me to check in 20 minutes"
 
 ## MVP Scope
 
 ### Included
 
-- Manual trigger via Slack (`/health`, natural language)
-- Health Check playbook with drill-down support
-- Threaded conversation with session context
-- Dynamic baseline (weekly comparison)
+- Manual trigger via Slack (`@bot` mentions, natural language)
+- Multi-agent architecture (coordinator + configurable specialists)
+- Declarative agent config (model, temperature, tools, instructions per agent)
+- Playbooks with YAML frontmatter
+- Threaded conversation with session context (ADK in-memory sessions)
+- Progress messages during analysis
 - Read-only — analysis only, no automated actions
 
 ### Not in MVP
@@ -287,6 +329,7 @@ Bot: ServiceZ last hour:
 - Session persistence (in-memory, lost on restart)
 - Multi-user / access control
 - Post-mortem generation
+- Playbook hot-reload (requires restart)
 
 ## Post-MVP Roadmap
 
@@ -294,5 +337,6 @@ Bot: ServiceZ last hour:
 2. **Post-mortem draft** — bot generates summary from thread after incident closure
 3. **Correlations** — temporal, deploy, cross-service
 4. **Incident history** — search similar past incidents
-5. **Redis** — persistent sessions
+5. **Persistent sessions** — Redis via ADK's session/database package
 6. **Multi-user** — full on-call team interaction
+7. **Playbook hot-reload** — detect changes without restart
