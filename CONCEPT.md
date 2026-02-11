@@ -57,13 +57,13 @@ Slack Gateway (reply in thread)
 
 **ADK Runner** — manages agent execution within sessions. Each Slack thread = one ADK session with its own conversation history. Uses ADK's `session.InMemoryService()`.
 
-**Coordinator Agent** — the orchestrator. Uses a fast/cheap model. Has no MCP tools itself. Has all playbooks as a knowledge base. When the operator asks something, the coordinator understands the request, decides which playbook steps are relevant (might be all steps from one playbook, a subset, or steps from multiple playbooks), delegates to the right specialists, and aggregates results.
+**Coordinator Agent** — the orchestrator. Uses a fast/cheap model. Has no MCP tools itself. Has a playbook index (name + description + tags for each playbook) in its instructions and a `get_playbook` tool to load full playbook content on demand. When the operator asks something, the coordinator matches the request against the index, loads only the relevant playbooks, picks the right steps, delegates to specialists, and aggregates results. This two-phase approach scales to dozens of playbooks without bloating the context.
 
 **Specialist Agents** — defined entirely in config. Each has its own model, temperature, behavioral instructions, and scoped set of MCP tools. They receive tasks from the coordinator, execute them using their tools, and return structured findings. They don't know about playbooks — they just do what the coordinator asks.
 
 **MCP Toolset** — ADK's built-in `McpToolset` connects to external MCP servers via SSE, discovers available tools, and makes them callable by agents. Each specialist is configured with only the MCP servers relevant to its role.
 
-**Playbooks** — markdown files that serve as a knowledge base for the coordinator. They describe analysis workflows, reference concrete dashboard names and queries, and define output formats. The coordinator draws from them selectively — not necessarily running a playbook end-to-end.
+**Playbooks** — markdown files that serve as a knowledge base for the coordinator. They describe analysis workflows, reference concrete dashboard names and queries, and define output formats. The coordinator sees only the playbook index at first and loads full content on demand via the `get_playbook` tool — keeping context small even with dozens of playbooks.
 
 **Agent Instructions** — markdown files describing each agent's behavior and response format. Separate from playbooks. Loaded as the agent's system instructions.
 
@@ -99,28 +99,27 @@ config/
 2. Slack gateway parses the message, sends progress indicator to the thread
 3. ADK runner finds (or creates) the session for this thread
 4. Coordinator agent receives the message
-5. Coordinator has all playbooks in its knowledge base. It understands "problems with apple pay" and decides which steps from which playbooks are relevant — maybe the payment-related metrics from one playbook, error log search from another, and skips infrastructure checks entirely because they're not relevant
-6. Coordinator delegates each relevant step to the right specialist agent
-7. Specialist agents execute tasks using their MCP tools, return findings
-8. Coordinator aggregates findings into a focused summary about the Apple Pay issue
-9. Summary posted to Slack thread
-10. Follow-up messages in the thread have full conversation context — operator can drill deeper, ask for comparisons, or pivot to a different angle
+5. Coordinator reads its playbook index (name + description + tags for each playbook). It matches "problems with apple pay" to relevant playbooks — e.g., `payment-investigation` (tags: payments, apple-pay) and `dependency-analysis` (tags: external-services, gateways)
+6. Coordinator calls `get_playbook("payment-investigation")` and `get_playbook("dependency-analysis")` to load their full content. Skips irrelevant playbooks entirely (e.g., infrastructure, deployment)
+7. Coordinator picks relevant steps from the loaded playbooks and delegates each to the right specialist agent
+8. Specialist agents execute tasks using their MCP tools, return findings
+9. Coordinator aggregates findings into a focused summary about the Apple Pay issue
+10. Summary posted to Slack thread
+11. Follow-up messages in the thread have full conversation context — the coordinator already has the loaded playbooks in context and can drill deeper, load additional playbooks, or pivot
 
 ### Agent Definitions
 
-Agents are defined in `config.yaml` — fully declarative. The Go code reads this config and builds the agent tree. No agent roles are hardcoded.
+The coordinator is configured separately — the engine knows it's special and automatically gives it the playbook index, `get_playbook` tool, and all specialist agents as sub-agents. Specialist agents are defined in the `agents` list.
 
 ```yaml
+coordinator:
+  model: gemini-2.0-flash
+  instruction: "instructions/coordinator.md"
+  temperature: 0.1
+
+# Everything below is an example — define whatever agents your stack needs
+
 agents:
-  - name: coordinator
-    model: gemini-2.0-flash
-    description: "Understands operator requests, picks relevant playbook steps, delegates to specialists, aggregates results"
-    instruction: "instructions/coordinator.md"
-    temperature: 0.1
-    tools: []
-
-  # Everything below is an example — define whatever agents your stack needs
-
   - name: metrics-analyst
     model: gemini-2.5-pro
     description: "Queries dashboards and interprets metrics data"
@@ -138,46 +137,62 @@ agents:
 
 To add a new specialist: add a YAML block, write an instruction file, point it to the right MCP servers. No Go code changes.
 
+### Playbook Selection
+
+The coordinator does not have all playbooks in its context. Instead, it uses a two-phase approach:
+
+**Phase 1 — Index matching.** The coordinator's instructions include a playbook index: name + description + tags for each playbook. This is small (~50 tokens per playbook) and scales to dozens of playbooks. The coordinator reads the operator's request and matches it against the index to identify relevant playbooks.
+
+**Phase 2 — On-demand loading.** The coordinator calls the `get_playbook(name)` tool to load the full content of only the playbooks it needs. This is a custom function tool built into the Go engine — not an MCP tool. Only relevant playbook content enters the context.
+
+This means: with 30 playbooks, the coordinator sees ~1500 tokens of index. A focused request like "problems with apple pay" loads maybe 1-2 playbooks. A broad request like "how's the system doing?" might load 3-4. The context stays lean.
+
 ### Playbook Format
 
-Playbooks have YAML frontmatter (for description) and markdown body. They reference concrete identifiers (dashboard names, log queries, panel names). The coordinator uses them as a knowledge base — it may run a playbook fully, partially, or combine steps from multiple playbooks depending on the operator's request.
+Playbooks have YAML frontmatter (description + tags) and markdown body. They reference concrete identifiers (dashboard names, log queries, panel names). Tags help the coordinator match requests to playbooks without reading full content.
 
 ```yaml
 ---
-description: "System health check — application metrics, log errors, infrastructure"
+description: "Payment service analysis — success rates, gateway errors, transaction logs"
+tags: [payments, apple-pay, google-pay, checkout, transactions]
 ---
 ```
 
 ```markdown
-# Health Check
+# Payment Investigation
 
-## Application Metrics
+## Payment Metrics
 
-Query the "Main Overview" dashboard. Pull these panels for the last 15 minutes:
-- Error Rate — separate system errors (5xx) from client errors (4xx)
-- Latency p99
-- Throughput
+Query the "Payments" dashboard. Pull these panels for the last 15 minutes:
+- Success rate per payment method (Apple Pay, Google Pay, Card, etc.)
+- Latency p99 per payment method
+- Transaction volume
 
-Compare each metric to the same time window last week.
-Flag as warning if deviation > 20%, critical if > 50%.
+Compare to the same time window last week.
+Flag as warning if success rate drops > 2%, critical if > 10%.
 
-## Log Errors
+## Payment Logs
 
-Search application logs for the last 15 minutes, severity >= ERROR.
-Identify top error messages, new error types, and affected services.
+Search payment service logs for the last 15 minutes.
+Filter: service=payment-service, severity >= WARN.
 
-## Infrastructure
+Identify:
+- Top error messages by payment method
+- Gateway timeout patterns
+- Affected endpoints
 
-Query the "Infrastructure" dashboard. Check:
-- Pod Restarts — last 1 hour
-- Queue Lag — last 15 minutes
-- DB Connections — last 15 minutes
+## Gateway Health
+
+Query the "Payment Gateways" dashboard. Check:
+- Gateway response times per provider
+- Gateway error rates per provider
+- Circuit breaker status
 
 ## Output format
 
-Present results grouped by section. Use status indicators.
-Only show details for warnings and critical items.
-Suggest what to check next if there are issues.
+Present results grouped by payment method / gateway.
+Highlight which provider is affected and which are healthy.
+Suggest next steps (check provider status page, check upstream, etc.).
 ```
 
 ### Agent Instruction Format
@@ -210,7 +225,7 @@ For each metric checked:
 
 **No commands.** The bot understands natural language. The operator describes a problem or asks a question — the coordinator figures out what to investigate.
 
-**Playbooks are a knowledge base, not a rigid script.** The coordinator draws from them selectively. "Problems with Apple Pay" triggers only the relevant steps, not a full system scan.
+**Playbooks are a knowledge base, not a rigid script.** The coordinator sees only the index, loads what it needs via `get_playbook`, and draws from them selectively. "Problems with Apple Pay" loads the payment playbook, not the infrastructure playbook.
 
 **Anomaly ≠ Incident.** Agent instructions tell each agent how to distinguish real problems from expected noise.
 
@@ -237,14 +252,12 @@ mcp_servers:
   - name: gcp-logging
     url: "https://gcp-logging-mcp.internal.example.com/sse"
 
-agents:
-  - name: coordinator
-    model: gemini-2.0-flash
-    description: "Understands operator requests, picks relevant playbook steps, delegates to specialists, aggregates results"
-    instruction: "instructions/coordinator.md"
-    temperature: 0.1
-    tools: []
+coordinator:
+  model: gemini-2.0-flash
+  instruction: "instructions/coordinator.md"
+  temperature: 0.1
 
+agents:
   - name: metrics-analyst
     model: gemini-2.5-pro
     description: "Queries dashboards and interprets metrics data"
@@ -262,7 +275,7 @@ agents:
 playbooks_dir: "playbooks/"
 ```
 
-MCP servers are deployed and managed separately. The bot connects to them via SSE as a client. ADK's `McpToolset` handles connection, tool discovery, and execution. Which agents use which MCP servers is defined in the agent config — the bot wires it up at startup.
+MCP servers are deployed and managed separately. The bot connects to them via SSE as a client. ADK's `McpToolset` handles connection, tool discovery, and execution. Which agents use which MCP servers is defined in the agent config — the bot wires it up at startup. The `get_playbook` tool is built into the engine and provided automatically to the coordinator.
 
 ## Slack UX
 

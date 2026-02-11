@@ -7,7 +7,8 @@ Step-by-step plan for building Incidently MVP. Each step produces a compilable i
 - **No commands**: The bot has no rigid commands. Operator describes a problem or asks a question in natural language. The coordinator decides what to investigate.
 - **Triggering**: `@bot` mentions in Slack channels. Socket Mode, no public URL needed.
 - **Multi-agent**: Coordinator agent has playbooks as a knowledge base. It understands the request, picks relevant steps, and delegates to specialist agents. Specialists have scoped MCP tools and behavioral instructions. All defined in config.
-- **Playbooks as knowledge base**: Playbooks are not rigid scripts to run end-to-end. The coordinator draws from them selectively — picking only the steps relevant to the operator's request. "Problems with Apple Pay" triggers payment-related checks, not a full system scan.
+- **Playbook selection — two-phase**: Coordinator sees only a playbook index (name + description + tags) in its instructions. It matches the request against the index and calls `get_playbook(name)` to load full content only for relevant playbooks. Scales to dozens of playbooks without bloating context.
+- **Playbooks as knowledge base**: Playbooks are not rigid scripts to run end-to-end. The coordinator draws from them selectively — picking only the steps relevant to the operator's request. "Problems with Apple Pay" loads the payment playbook, not infrastructure.
 - **Playbooks vs instructions**: Playbooks = domain knowledge (WHAT to check, concrete queries). Agent instructions = behavior (HOW to act, response format). Separate concerns.
 - **Generic engine**: Go code knows nothing about specific tools. It reads config, builds agents, connects MCP servers, runs the loop. All domain knowledge lives in config, playbooks, and instructions.
 - **Progress messages**: Bot sends intermediate updates to Slack while the agent works so the user knows something is happening.
@@ -47,12 +48,13 @@ Create the Go module, directories, and config loading.
 - Define `config/config.yaml` with the full schema:
   - `slack`: app_token, bot_token
   - `mcp_servers`: list of {name, url}
-  - `agents`: list of {name, model, description, instruction, temperature, tools}
+  - `coordinator`: {model, instruction, temperature} — separate from agents, the engine gives it playbook index, `get_playbook` tool, and all agents as sub-agents automatically
+  - `agents`: list of {name, model, description, instruction, temperature, tools} — specialist agents only
   - `playbooks_dir`: path to playbooks directory
 - Write `internal/config/config.go`:
-  - Structs matching the yaml schema (Config, SlackConfig, MCPServerConfig, AgentConfig)
+  - Structs matching the yaml schema (Config, SlackConfig, MCPServerConfig, CoordinatorConfig, AgentConfig)
   - `Load(path string) (*Config, error)` — reads yaml, resolves `${ENV_VAR}` references from environment
-  - Validation: check required fields, verify instruction files exist, verify tools reference defined MCP servers
+  - Validation: check required fields, verify instruction files exist, verify agent tools reference defined MCP servers
 - Write `cmd/bot/main.go` — loads config, logs it, exits
 
 **Explanation:** Config is the foundation and carries significant weight — it defines the entire agent topology, not just connection strings. The agent definitions (model, temperature, tools, instruction path) all live here. Validation at load time catches misconfigurations early (e.g., an agent referencing an MCP server that isn't defined). After this step we can run the binary and confirm config loads correctly.
@@ -85,14 +87,15 @@ Load playbook markdown files and agent instruction files.
 
 **What to do:**
 - Write `internal/agent/playbook.go`:
-  - `Playbook` struct: `Name string`, `Description string`, `Content string`
-  - `LoadPlaybooks(dir string) ([]Playbook, error)` — reads all `.md` files from the directory, parses YAML frontmatter to extract `description`, rest is `Content`. `Name` from filename without extension
+  - `Playbook` struct: `Name string`, `Description string`, `Tags []string`, `Content string`
+  - `LoadPlaybooks(dir string) ([]Playbook, error)` — reads all `.md` files from the directory, parses YAML frontmatter to extract `description` and `tags`, rest is `Content`. `Name` from filename without extension
   - `LoadInstruction(path string) (string, error)` — reads a markdown file and returns its content as a string (used for agent instructions)
-  - `BuildPlaybookIndex(playbooks []Playbook) string` — builds a summary listing all playbook names + descriptions, for injection into the coordinator's knowledge base
-- Create sample `playbooks/health-check.md` with frontmatter and placeholder steps
+  - `BuildPlaybookIndex(playbooks []Playbook) string` — builds a compact index listing each playbook's name, description, and tags. This is what goes into the coordinator's instructions — small enough to scale to 30+ playbooks (~50 tokens each)
+  - `GetPlaybookByName(name string) (string, error)` — returns full content of a playbook by name. This backs the `get_playbook` custom tool
+- Create sample `playbooks/health-check.md` with frontmatter (including tags) and placeholder steps
 - Create sample `instructions/coordinator.md` with placeholder coordinator behavior
 
-**Explanation:** Two types of markdown files serve different purposes. Playbooks are domain knowledge (WHAT to check) — loaded with frontmatter parsing so we can build an index for the coordinator. Agent instructions describe behavior (HOW to act) — loaded as plain markdown strings and injected as system instructions into each agent. The playbook index plus full playbook content gets appended to the coordinator's instructions so it has a complete knowledge base. The coordinator uses this to understand the operator's request and pick relevant steps — it does not blindly run playbooks end-to-end. Specialist agents never see playbooks — they only get their own behavioral instructions and specific tasks from the coordinator.
+**Explanation:** Two types of markdown files serve different purposes. Playbooks are domain knowledge (WHAT to check) — loaded with frontmatter parsing so we can build an index for the coordinator. Agent instructions describe behavior (HOW to act) — loaded as plain markdown strings and injected as system instructions into each agent. Critically, the coordinator does NOT get full playbook content in its instructions — only the compact index (name + description + tags). To access full content, the coordinator calls the `get_playbook` tool. This two-phase approach keeps the coordinator's context lean even with dozens of playbooks. Tags in the frontmatter give the coordinator better matching signal without needing to load content (e.g., tags: [payments, apple-pay] helps match "problems with apple pay").
 
 ---
 
@@ -107,10 +110,11 @@ Build the agent tree from config: coordinator + specialists, each with their own
   - `NewService(cfg *config.Config, playbooks []Playbook) (*Service, error)`:
     1. Create MCP toolsets: for each MCP server in config, create `mcptoolset.New()` with SSE transport. Store in a map: server name → toolset
     2. Load agent instructions: for each agent in config, call `LoadInstruction(agent.Instruction)`
-    3. Build specialist agents: for each non-coordinator agent, create `llmagent.New()` with its model, temperature, loaded instruction, and only the MCP toolsets matching its `tools` list
-    4. Build coordinator agent: create `llmagent.New()` with its model, temperature, its own instruction + playbook index + full playbook content appended as knowledge base, and the specialist agents registered as sub-agents (via ADK's agent transfer mechanism)
-    5. Create `session.InMemoryService()`
-    6. Create `runner.New()` with the coordinator as root agent and the session service
+    3. Create `get_playbook` custom function tool: a Go function tool that takes a playbook name and returns its full content via `GetPlaybookByName()`. This is an ADK function tool, not an MCP tool
+    4. Build specialist agents: for each agent in `config.Agents`, create `llmagent.New()` with its model, temperature, loaded instruction, and only the MCP toolsets matching its `tools` list
+    5. Build coordinator: read `config.Coordinator`, create `llmagent.New()` with its model, temperature, its own instruction + playbook index appended, the `get_playbook` function tool, and all specialist agents registered as sub-agents (via ADK's agent transfer mechanism). The coordinator is separate from the agents list — the engine knows it's special
+    6. Create `session.InMemoryService()`
+    7. Create `runner.New()` with the coordinator as root agent and the session service
   - `HandleMessage(ctx context.Context, userID string, threadTS string, text string, onProgress func(string)) (string, error)`:
     - Get or create session by threadTS
     - Build `*genai.Content` from user text
@@ -121,7 +125,7 @@ Build the agent tree from config: coordinator + specialists, each with their own
     - Return the final response text
   - `Close()` — closes all MCP toolset connections
 
-**Explanation:** This is where config becomes a running system. The Go code reads agent definitions and builds an ADK agent tree — coordinator at the root, specialists as sub-agents. Each specialist gets only the MCP tools from its config. The coordinator gets no MCP tools but knows about all specialists via ADK's agent transfer/delegation and has all playbooks as knowledge base. When the operator says "problems with apple pay", the coordinator reads its playbook knowledge, identifies which steps are relevant (maybe just payment metrics and error logs, skipping infrastructure), and delegates only those to the right specialists. ADK handles the hand-off — each specialist runs its own ReAct loop with its own tools and returns results.
+**Explanation:** This is where config becomes a running system. The Go code reads agent definitions and builds an ADK agent tree — coordinator at the root, specialists as sub-agents. Each specialist gets only the MCP tools from its config. The coordinator gets no MCP tools but has: (1) the playbook index in its instructions for matching requests to playbooks, (2) the `get_playbook` function tool to load full content on demand, and (3) specialist agents via ADK's agent transfer/delegation. When the operator says "problems with apple pay", the coordinator reads the playbook index, sees that `payment-investigation` has tags matching the request, calls `get_playbook("payment-investigation")` to load it, picks relevant steps, and delegates to the right specialists. The context stays lean — only loaded playbooks enter it, not all 30.
 
 ---
 
@@ -140,7 +144,7 @@ Wire Slack gateway → agent service → Slack reply, with intermediate progress
 - Update `main.go` — full wiring: config → playbooks → agent service → slack gateway with handler
 - Add graceful shutdown: listen for SIGINT/SIGTERM, cancel context, close agent service (MCP connections), disconnect Slack
 
-**Explanation:** This connects all the pieces into a working system. A Slack message arrives → gateway parses it → agent service creates/retrieves the ADK session → coordinator reads its playbook knowledge base, decides what's relevant to the operator's request, delegates to specialists → specialists call MCP tools and return findings → coordinator aggregates and produces a focused summary → response posted to Slack thread. Progress callbacks fire on agent transfers and tool calls so the user sees intermediate updates. Graceful shutdown ensures MCP connections close cleanly and Slack disconnects properly.
+**Explanation:** This connects all the pieces into a working system. A Slack message arrives → gateway parses it → agent service creates/retrieves the ADK session → coordinator reads playbook index, calls `get_playbook` for relevant ones, picks steps, delegates to specialists → specialists call MCP tools and return findings → coordinator aggregates and produces a focused summary → response posted to Slack thread. Progress callbacks fire on agent transfers and tool calls so the user sees intermediate updates. Graceful shutdown ensures MCP connections close cleanly and Slack disconnects properly.
 
 ---
 
@@ -163,7 +167,7 @@ Create real agent instructions and playbooks targeting the test environment. Tes
   - Verify progress messages appear during analysis
 - Fix issues discovered during testing
 
-**Explanation:** Everything built in steps 1-5 is generic infrastructure. This step adds the domain content — real instructions that make agents useful and real playbooks targeting actual dashboards and logs. The key validation here is that the coordinator uses playbooks as a knowledge base, not a rigid script. A focused request should trigger only relevant steps. A broad request should use more of the playbook content. This proves the natural language approach works — no commands, just the operator describing what they need.
+**Explanation:** Everything built in steps 1-5 is generic infrastructure. This step adds the domain content — real instructions that make agents useful and real playbooks targeting actual dashboards and logs. Key validations: (1) the two-phase playbook selection works — coordinator reads the index, loads only relevant playbooks via `get_playbook`, not all of them; (2) a focused request triggers only relevant steps while a broad request loads more playbooks; (3) tags in frontmatter help the coordinator match accurately. This proves the natural language approach works at scale — no commands, lean context, just the operator describing what they need.
 
 ---
 
