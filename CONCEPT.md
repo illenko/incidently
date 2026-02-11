@@ -37,10 +37,11 @@ Slack Gateway (socket mode, @bot mentions, threads)
     ↓
 ADK Runner (session per thread)
     ↓
-Coordinator Agent (fast model, no tools)
-    ├── has playbooks as knowledge base
+Coordinator Agent (fast model, get_playbook tool, no MCP tools)
+    ├── has playbook index in instructions
+    ├── loads relevant playbooks on demand via get_playbook
     ├── understands operator's request
-    ├── picks relevant steps from relevant playbooks
+    ├── picks relevant steps from loaded playbooks
     ├── delegates to specialist agents
     ├── aggregates results
     │
@@ -114,6 +115,7 @@ The coordinator is configured separately — the engine knows it's special and a
 ```yaml
 coordinator:
   model: gemini-2.0-flash
+  description: "Understands operator requests, picks relevant playbooks, delegates to specialists, aggregates results"
   instruction: "instructions/coordinator.md"
   temperature: 0.1
 
@@ -151,14 +153,12 @@ This means: with 30 playbooks, the coordinator sees ~1500 tokens of index. A foc
 
 Playbooks have YAML frontmatter (description + tags) and markdown body. They reference concrete identifiers (dashboard names, log queries, panel names). Tags help the coordinator match requests to playbooks without reading full content.
 
-```yaml
+```markdown
 ---
 description: "Payment service analysis — success rates, gateway errors, transaction logs"
 tags: [payments, apple-pay, google-pay, checkout, transactions]
 ---
-```
 
-```markdown
 # Payment Investigation
 
 ## Payment Metrics
@@ -254,6 +254,7 @@ mcp_servers:
 
 coordinator:
   model: gemini-2.0-flash
+  description: "Understands operator requests, picks relevant playbooks, delegates to specialists, aggregates results"
   instruction: "instructions/coordinator.md"
   temperature: 0.1
 

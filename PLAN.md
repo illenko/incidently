@@ -48,7 +48,7 @@ Create the Go module, directories, and config loading.
 - Define `config/config.yaml` with the full schema:
   - `slack`: app_token, bot_token
   - `mcp_servers`: list of {name, url}
-  - `coordinator`: {model, instruction, temperature} — separate from agents, the engine gives it playbook index, `get_playbook` tool, and all agents as sub-agents automatically
+  - `coordinator`: {model, description, instruction, temperature} — separate from agents, the engine gives it playbook index, `get_playbook` tool, and all agents as sub-agents automatically
   - `agents`: list of {name, model, description, instruction, temperature, tools} — specialist agents only
   - `playbooks_dir`: path to playbooks directory
 - Write `internal/config/config.go`:
@@ -109,10 +109,10 @@ Build the agent tree from config: coordinator + specialists, each with their own
   - `Service` struct holding: ADK `runner.Runner`, `session.Service`, list of MCP toolsets (for cleanup)
   - `NewService(cfg *config.Config, playbooks []Playbook) (*Service, error)`:
     1. Create MCP toolsets: for each MCP server in config, create `mcptoolset.New()` with SSE transport. Store in a map: server name → toolset
-    2. Load agent instructions: for each agent in config, call `LoadInstruction(agent.Instruction)`
+    2. Load agent instructions: for the coordinator and each agent in config, call `LoadInstruction(agent.Instruction)`
     3. Create `get_playbook` custom function tool: a Go function tool that takes a playbook name and returns its full content via `GetPlaybookByName()`. This is an ADK function tool, not an MCP tool
     4. Build specialist agents: for each agent in `config.Agents`, create `llmagent.New()` with its model, temperature, loaded instruction, and only the MCP toolsets matching its `tools` list
-    5. Build coordinator: read `config.Coordinator`, create `llmagent.New()` with its model, temperature, its own instruction + playbook index appended, the `get_playbook` function tool, and all specialist agents registered as sub-agents (via ADK's agent transfer mechanism). The coordinator is separate from the agents list — the engine knows it's special
+    5. Build coordinator: read `config.Coordinator`, create `llmagent.New()` with its model, temperature, its own instruction + playbook index appended, the `get_playbook` function tool, and all specialist agents passed via the `SubAgents` field in `llmagent.Config`. ADK uses each sub-agent's `Description` to let the coordinator's LLM decide who to delegate to — this is why agent descriptions matter in config
     6. Create `session.InMemoryService()`
     7. Create `runner.New()` with the coordinator as root agent and the session service
   - `HandleMessage(ctx context.Context, userID string, threadTS string, text string, onProgress func(string)) (string, error)`:
