@@ -1,0 +1,32 @@
+slack:
+  app_token: "${SLACK_APP_TOKEN}"
+  bot_token: "${SLACK_BOT_TOKEN}"
+
+mcp_servers:
+  - name: grafana
+    url: "https://grafana-mcp.internal.example.com/sse"
+  - name: gcp-logging
+    url: "https://gcp-logging-mcp.internal.example.com/sse"
+
+coordinator:
+  model: gemini-2.0-flash
+  description: "Understands operator requests, picks relevant playbooks, delegates to specialists, aggregates results"
+  instruction: "instructions/coordinator.md"
+  temperature: 0.1
+
+agents:
+  - name: metrics-analyst
+    model: gemini-2.5-pro
+    description: "Queries dashboards and interprets metrics data"
+    instruction: "instructions/metrics-analyst.md"
+    temperature: 0.2
+    tools: [grafana]
+
+  - name: log-analyst
+    model: gemini-2.5-pro
+    description: "Searches and analyzes application logs"
+    instruction: "instructions/log-analyst.md"
+    temperature: 0.2
+    tools: [gcp-logging]
+
+playbooks_dir: "playbooks/"
