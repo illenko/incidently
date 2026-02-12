@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/illenko/incidently/internal/config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,7 +27,7 @@ type Service struct {
 }
 
 type GetPlaybookArgs struct {
-	Name string `json:"name" jsonschema:"description=Name of the playbook to load"`
+	Name string `json:"name" jsonschema:"Name of the playbook to load"`
 }
 
 type GetPlaybookResult struct {
@@ -120,7 +121,25 @@ func (s *Service) HandleMessage(
 ) (string, error) {
 	slog.Info("handling message", "user", userID, "thread", threadTS, "text", text)
 
-	msg := genai.NewContentFromText(text, genai.RoleUser)
+	_, err := s.sessions.Get(ctx, &session.GetRequest{
+		AppName:   "incidently",
+		UserID:    userID,
+		SessionID: threadTS,
+	})
+	if err != nil {
+		slog.Info("creating new session", "user", userID, "thread", threadTS)
+		_, err = s.sessions.Create(ctx, &session.CreateRequest{
+			AppName:   "incidently",
+			UserID:    userID,
+			SessionID: threadTS,
+		})
+		if err != nil {
+			return "", fmt.Errorf("creating session: %w", err)
+		}
+	}
+
+	textWithTime := fmt.Sprintf("[Current time: %s]\n\n%s", time.Now().UTC().Format("2006-01-02 15:04 UTC"), text)
+	msg := genai.NewContentFromText(textWithTime, genai.RoleUser)
 
 	var parts []string
 
