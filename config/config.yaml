@@ -4,12 +4,12 @@ slack:
 
 mcp_servers:
   - name: grafana
-    url: "https://grafana-mcp.internal.example.com/sse"
+    url: "http://localhost:8000/sse"
   - name: gcp-logging
-    url: "https://gcp-logging-mcp.internal.example.com/sse"
+    url: "http://localhost:8081"
 
 coordinator:
-  model: gemini-2.0-flash
+  model: gemini-2.5-pro
   description: "Understands operator requests, picks relevant playbooks, delegates to specialists, aggregates results"
   instruction: "instructions/coordinator.md"
   temperature: 0.1
