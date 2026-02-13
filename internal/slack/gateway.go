@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	"github.com/illenko/incidently/internal/config"
@@ -104,7 +105,7 @@ func (g *Gateway) Run(ctx context.Context, handler func(msg Message)) {
 func (g *Gateway) PostMessage(channel, threadTS, text string) error {
 	_, _, err := g.api.PostMessage(
 		channel,
-		slack.MsgOptionText(text, false),
+		slack.MsgOptionText(mdToMrkdwn(text), false),
 		slack.MsgOptionTS(threadTS),
 	)
 	if err != nil {
@@ -117,4 +118,21 @@ func stripBotMention(text, botID string) string {
 	mention := fmt.Sprintf("<@%s>", botID)
 	text = strings.Replace(text, mention, "", 1)
 	return strings.TrimSpace(text)
+}
+
+var (
+	headerRe = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
+	boldRe   = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	linkRe   = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+)
+
+// mdToMrkdwn converts common Markdown patterns to Slack mrkdwn format.
+func mdToMrkdwn(text string) string {
+	// ## Header → *Header*
+	text = headerRe.ReplaceAllString(text, "*$1*")
+	// **bold** → *bold*
+	text = boldRe.ReplaceAllString(text, "*$1*")
+	// [text](url) → <url|text>
+	text = linkRe.ReplaceAllString(text, "<$2|$1>")
+	return text
 }

@@ -5,8 +5,6 @@ slack:
 mcp_servers:
   - name: grafana
     url: "http://localhost:8000/sse"
-  - name: gcp-logging
-    url: "http://localhost:8081"
 
 coordinator:
   model: gemini-2.5-pro
@@ -15,18 +13,11 @@ coordinator:
   temperature: 0.1
 
 agents:
-  - name: metrics-analyst
+  - name: system-monitoring
     model: gemini-2.5-pro
-    description: "Queries dashboards and interprets metrics data"
-    instruction: "instructions/metrics-analyst.md"
-    temperature: 0.2
+    description: "Focused on quick check for system health, compares current metrics against baseline"
+    instruction: "instructions/system-monitoring.md"
+    temperature: 0.1
     tools: [grafana]
-
-  - name: log-analyst
-    model: gemini-2.5-pro
-    description: "Searches and analyzes application logs"
-    instruction: "instructions/log-analyst.md"
-    temperature: 0.2
-    tools: [gcp-logging]
 
 playbooks_dir: "playbooks/"

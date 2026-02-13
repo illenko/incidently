@@ -43,7 +43,23 @@ func NewService(ctx context.Context, cfg *config.Config, playbooks []Playbook) (
 	for _, srv := range cfg.MCPServers {
 		slog.Info("creating MCP toolset", "name", srv.Name, "url", srv.URL)
 		transport := &mcp.SSEClientTransport{Endpoint: srv.URL}
-		ts, err := mcptoolset.New(mcptoolset.Config{Transport: transport})
+
+		mcpClient := mcp.NewClient(&mcp.Implementation{Name: "incidently", Version: "1.0"}, nil)
+		mcpSession, err := mcpClient.Connect(ctx, transport, nil)
+		if err != nil {
+			return nil, fmt.Errorf("connecting to MCP server %s: %w", srv.Name, err)
+		}
+		toolsResult, err := mcpSession.ListTools(ctx, &mcp.ListToolsParams{})
+		if err != nil {
+			return nil, fmt.Errorf("listing tools from MCP server %s: %w", srv.Name, err)
+		}
+		for _, t := range toolsResult.Tools {
+			slog.Info("MCP tool available", "server", srv.Name, "tool", t.Name, "description", t.Description)
+		}
+		mcpSession.Close()
+
+		transport2 := &mcp.SSEClientTransport{Endpoint: srv.URL}
+		ts, err := mcptoolset.New(mcptoolset.Config{Transport: transport2})
 		if err != nil {
 			return nil, fmt.Errorf("creating MCP toolset %s: %w", srv.Name, err)
 		}
@@ -117,7 +133,7 @@ func NewService(ctx context.Context, cfg *config.Config, playbooks []Playbook) (
 func (s *Service) HandleMessage(
 	ctx context.Context,
 	userID, threadTS, text string,
-	onProgress func(string),
+	onProgress func(text string, immediate bool),
 ) (string, error) {
 	slog.Info("handling message", "user", userID, "thread", threadTS, "text", text)
 
@@ -155,7 +171,7 @@ func (s *Service) HandleMessage(
 				"to", event.Actions.TransferToAgent,
 				"thread", threadTS,
 			)
-			onProgress(fmt.Sprintf("Delegating to %s...", event.Actions.TransferToAgent))
+			onProgress(fmt.Sprintf("Delegating to %s...", event.Actions.TransferToAgent), true)
 		}
 
 		if event.Content != nil {
@@ -166,6 +182,7 @@ func (s *Service) HandleMessage(
 						"tool", part.FunctionCall.Name,
 						"thread", threadTS,
 					)
+					onProgress(fmt.Sprintf("_%s_ is working...", event.Author), false)
 				}
 			}
 		}

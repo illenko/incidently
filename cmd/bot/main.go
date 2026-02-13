@@ -78,15 +78,23 @@ func run() error {
 		}
 
 		var mu sync.Mutex
-		lastProgress := time.Now()
-		onProgress := func(text string) {
+		lastImmediate := time.Now()
+		lastBackground := time.Now()
+		onProgress := func(text string, immediate bool) {
 			mu.Lock()
 			defer mu.Unlock()
-			if time.Since(lastProgress) < 5*time.Second {
-				return
+			if immediate {
+				if time.Since(lastImmediate) < 5*time.Second {
+					return
+				}
+				lastImmediate = time.Now()
+			} else {
+				if time.Since(lastBackground) < time.Minute {
+					return
+				}
+				lastBackground = time.Now()
 			}
-			lastProgress = time.Now()
-			slog.Debug("sending progress", "thread", msg.ThreadTS, "text", text)
+			slog.Debug("sending progress", "thread", msg.ThreadTS, "text", text, "immediate", immediate)
 			if err := gw.PostMessage(msg.Channel, msg.ThreadTS, text); err != nil {
 				slog.Error("failed to send progress", "error", err, "thread", msg.ThreadTS)
 			}
